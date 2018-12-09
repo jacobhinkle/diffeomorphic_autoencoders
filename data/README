@@ -1,0 +1,21 @@
+This is a partial download of the OASIS-3 dataset.
+
+Users should interface with this through the oasis3.h5 file as well as the
+subject_metadata.csv.
+
+The `/scan_labels` dataset in the h5 file allows one to
+join against the csv to get all the available metadata. Note that for some
+reason age was not available at the time of download.
+
+The most relevant data resides in the `/skullstripped` dataset which is of size
+(1983,256,256,256) and holds all 1983 downloadable skull-stripped brain images.
+This dataset employs LZF compression with each individual image constituting a
+"chunk" (chunk_size=(1,256,256,256)). This should enable somewhat efficient
+random image access, and greatly improved writing speed.
+
+NOTE: There are 1984 listed Freesurfers on central.xnat.org, but one of them,
+OAS30336_Freesurfer53_d0244 is empty.
+
+For detailed information about this data, see the website
+https://oasis-brains.org, as well as the downloaded data dictionary (PDF file)
+in this directory.
