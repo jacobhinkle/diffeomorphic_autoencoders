@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import h5py
+from utils import tqdm
+import numpy as np
 
 
 class OASISDataset(Dataset):
@@ -58,3 +60,37 @@ class OASISDataset(Dataset):
         if self.pooling is not None:
             I = F.avg_pool3d(I, self.pooling)
         return idx, I
+
+def batch_average(dataloader, **kwargs):
+    """Compute the average using streaming batches from a dataloader along a given dimension"""
+    avg = None
+    sumsizes = 0
+    for (i, img) in tqdm(dataloader, 'image avg'):
+        sz = img.shape[0]
+        avi = img.to('cuda').mean(**kwargs)
+        if avg is None:
+            avg = avi
+        else:
+            # add similar-sized numbers using this running average
+            avg = avg*(sumsizes/(sumsizes+sz)) + avi*(sz/(sumsizes+sz))
+        sumsizes += sz
+    return avg
+
+docrop = 1
+if docrop:
+    crop = np.asarray(
+    [[ 47, 212],
+     [ 16, 251],
+     [  9, 228]])
+    if True:
+        crop[:,0] -= 1
+        crop[:,1] += 1
+else:
+    crop = None
+ds_first = 2000
+one_scan_per_subject = True
+ds_pooling = 2
+oasis_ds = OASISDataset(crop=crop,
+                        first=ds_first,
+                        pooling=ds_pooling,
+                        one_scan_per_subject=one_scan_per_subject)

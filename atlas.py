@@ -51,18 +51,18 @@ def affine_atlas(dataset,
             T = Ts[ix,...].contiguous().to(device)
             img = img.to(device)
             img.requires_grad_(False)
-            A, T, losses_match = affine_matching(I,
-                                                 img,
-                                                 A=A,
-                                                 T=T,
-                                                 affine_steps=affine_steps,
-                                                 reg_weightA=reg_weightA,
-                                                 reg_weightT=reg_weightT,
-                                                 learning_rate_A=learning_rate_A,
-                                                 learning_rate_T=learning_rate_T,
-                                                 progress_bar=False)
-            A.requires_grad_(False)
-            T.requires_grad_(False)
+            #A, T, losses_match = affine_matching(I,
+            #                                     img,
+            #                                     A=A,
+            #                                     T=T,
+            #                                     affine_steps=affine_steps,
+            #                                     reg_weightA=reg_weightA,
+            #                                     reg_weightT=reg_weightT,
+            #                                     learning_rate_A=learning_rate_A,
+            #                                     learning_rate_T=learning_rate_T,
+            #                                     progress_bar=False)
+            A.requires_grad_(True)
+            T.requires_grad_(True)
             I.requires_grad_(True)
             Idef = lm.affine_interp(I, A+eye, T)
             regtermA = mse_loss(A,A)
@@ -73,6 +73,9 @@ def affine_atlas(dataset,
             loss.detach_()
             epoch_loss += loss.item()
             iter_losses.append(loss)
+            with torch.no_grad():
+                A.add_(-learning_rate_A*len(dataloader.dataset)/img.shape[0], A.grad)
+                T.add_(-learning_rate_T*len(dataloader.dataset)/img.shape[0], T.grad)
             #itbar.set_postfix(minibatch_loss=itloss)
             As[ix,...] = A.detach().to(As.device)
             Ts[ix,...] = T.detach().to(Ts.device)
@@ -84,13 +87,13 @@ def affine_atlas(dataset,
 def lddmm_atlas(dataset,
         I=None,
         num_epochs=500,
-        batch_size=2,
-        lddmm_steps=10,
+        batch_size=10,
+        lddmm_steps=1,
         lddmm_integration_steps=5,
-        reg_weight=1e-3,
-        learning_rate_pose = 1e-4,
-        learning_rate_image = 1e1,
-        fluid_params=[1.0,.1,.01],
+        reg_weight=1e2,
+        learning_rate_pose = 2e2,
+        learning_rate_image = 1e4,
+        fluid_params=[0.1,0.,.01],
         device='cuda',
         momentum_pattern='oasis_momenta/momentum_{}.pth'):
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, pin_memory=True, shuffle=False)
@@ -105,35 +108,56 @@ def lddmm_atlas(dataset,
     losses = []
     iter_losses = []
     epbar = tqdm(range(num_epochs), desc='epoch', position=0)
+    ms = torch.zeros(len(dataset),3,*I.shape[-3:], dtype=I.dtype).pin_memory()
     for epoch in epbar:
         epoch_loss = 0.0
-        itbar = tqdm(dataloader, desc='iter', position=1)
+        itbar = dataloader
+        if False:
+            itbar = tqdm(itbar, desc='iter', position=1)
+        image_optimizer.zero_grad()
+        I.requires_grad_(True)
         for it, (ix, img) in enumerate(itbar):
-            m = torch.zeros(img.shape[0],3,*I.shape[-3:], dtype=I.dtype)
-            for i,ii in enumerate(ix):
-                try:
-                    m[i,...] = torch.load(momentum_pattern.format(ii))
-                except FileNotFoundError:
-                    pass
+            if False:
+                m = torch.zeros(img.shape[0],3,*I.shape[-3:], dtype=I.dtype)
+                for i,ii in enumerate(ix):
+                    try:
+                        m[i,...] = torch.load(momentum_pattern.format(ii))
+                    except FileNotFoundError:
+                        pass
+            else:
+                m = ms[ix,...].detach()
             m = m.to(device)
             img = img.to(device)
-            I.requires_grad_(False)
-            img.requires_grad_(False)
-            m, losses_match = lddmm_matching(I, img, m=m, lddmm_steps=lddmm_steps, progress_bar=False)
-            m.requires_grad_(False)
-            I.requires_grad_(True)
+            #I.requires_grad_(False)
+            #img.requires_grad_(False)
+            #m, losses_match = lddmm_matching(I, img,
+            #                                 m=m,
+            #                                 lddmm_steps=lddmm_steps,
+            #                                 fluid_params=fluid_params,
+            #                                 learning_rate_pose=learning_rate_pose,
+            #                                 reg_weight=reg_weight,
+            #                                 progress_bar=False)
+            m.requires_grad_(True)
+            if m.grad is not None:
+                m.grad.zero_()
             h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
             Idef = lm.interp(I, m)
             v = metric.sharp(m)
             regterm = (v*m).mean()
-            loss = mse_loss(Idef, img) + reg_weight*regterm
-            image_optimizer.step()
-            epoch_loss += loss.item()*img.shape[0]/len(dataloader.dataset)
+            loss = (mse_loss(Idef, img) + reg_weight*regterm)*img.shape[0]/len(dataloader.dataset)
+            loss.backward()
+            with torch.no_grad():
+                m.add_(-learning_rate_pose*len(dataloader.dataset)/img.shape[0], metric.flat(m.grad))
+            epoch_loss += loss.item()
             iter_losses.append(loss.item())
-            itbar.set_postfix(minibatch_loss=loss.item())
-            for i,ii in enumerate(ix):
-                torch.save(m[i,...], momentum_pattern.format(ii))
+            #itbar.set_postfix(minibatch_loss=loss.item())
+            if False:
+                for i,ii in enumerate(ix):
+                    torch.save(m[i,...], momentum_pattern.format(ii))
+            else:
+                ms[ix,...] = m.detach().cpu()
+        image_optimizer.step()
         losses.append(epoch_loss)
         epbar.set_postfix(epoch_loss=epoch_loss)
-    return I, losses, iter_losses
+    return I.detach(), ms.detach(), losses, iter_losses
 
