@@ -10,6 +10,9 @@ import random
 
 from matching import *
 
+from importlib import reload
+import lagomorph
+reload(lagomorph)
 import lagomorph as lm
 
 def MLP(widths, activation=None, last_layer_scale=1.0):
@@ -103,7 +106,7 @@ def deep_affine_atlas(dataset,
     I.requires_grad_(True)
     pose_optimizer = torch.optim.Adam(affine_net.parameters(),
                                       lr=learning_rate_pose,
-                                      weight_decay=0e-5)
+                                      weight_decay=1e-5)
     image_optimizer = torch.optim.SGD([I],
                                       lr=learning_rate_image,
                                       weight_decay=0)
@@ -112,10 +115,12 @@ def deep_affine_atlas(dataset,
     epbar = tqdm(range(num_epochs), desc='epoch', position=0)
     for epoch in epbar:
         epoch_loss = 0.0
-        itbar = tqdm(dataloader, desc='iter', position=1)
+        itbar = dataloader
+        if False:
+            itbar = tqdm(itbar, desc='iter', position=1)
+        image_optimizer.zero_grad()
         for it, (ix, img) in enumerate(itbar):
             pose_optimizer.zero_grad()
-            image_optimizer.zero_grad()
             img = img.to(device)
             A, T = affine_net(img.view(img.shape[0],-1))
             Idef = lm.affine_interp(I, A+eye, T)
@@ -124,10 +129,10 @@ def deep_affine_atlas(dataset,
             loss = mse_loss(Idef, img) + .5*reg_weightA*regtermA + .5*reg_weightT*regtermT
             epoch_loss += loss.item()*img.shape[0]/len(dataloader.dataset)
             iter_losses.append(loss.item())
-            itbar.set_postfix(minibatch_loss=loss.item())
+            #itbar.set_postfix(minibatch_loss=loss.item())
             loss.backward()
             pose_optimizer.step()
-            image_optimizer.step()
+        image_optimizer.step()
         losses.append(epoch_loss)
         epbar.set_postfix(epoch_loss=epoch_loss)
         if False: # track loss on entire dataset at every iteration
@@ -173,45 +178,39 @@ def conv_up_from_spec(conv_layers, image_size, out_channels):
     return layers
 
 
-class PreconditionedExpMapFunction(torch.autograd.Function):
-    """This is the same as lm.expmap, but with a preconditioned gradient on the
-    momentum, obtained by applying metric.flat to the result of backward()."""
-    @staticmethod
-    def forward(ctx, metric, m, num_steps):
-        ctx.save_for_backward(m)
-        ctx.metric = metric
-        ctx.h = lm.expmap(metric, m, num_steps=num_steps)
-        return ctx.h
-    @staticmethod
-    def backward(ctx, gradout):
-        ctx.h.backward()
-        m = ctx.saved_tensors
-        dm = ctx.metric.flat(m.grad)
-        return _, dm, _
-precond_expmap = PreconditionedExpMapFunction.apply
-
-
 class MomentumPredictor(nn.Module):
     def __init__(self,
                  img_size=(1,1,256,256,256),
-                 conv_layers=[(7,8,2),
-                              (3,4,2),
-                              (3,4,2),
-                              (5,2,1)]):
+                 conv_layers=[(5,4,2),
+                              (5,4,2),
+                              (5,2,2),
+                              (3,1,1)],
+                 mlp_hidden=[256,64]):
         super(MomentumPredictor, self).__init__()
         self.img_size = img_size
         self.down_layers = conv_down_from_spec(conv_layers, img_size)
         from itertools import chain
         self.down_layers_params = nn.ParameterList(chain(*[p.parameters() \
                                              for p in self.down_layers]))
+        Itest = torch.zeros(img_size, dtype=torch.float32)
+        Itest,_,_ = self.down_net(Itest)
+        print(Itest.shape)
+        n_features = Itest.view(1,-1).shape[1]
+        del Itest
+        print(f"n_features={n_features}")
+        self.mlp = MLP([n_features] + mlp_hidden)# + [n_features])
+
         self.up_layers = conv_up_from_spec(conv_layers, img_size, 3)
         self.up_layers_params = nn.ParameterList(chain(*[p.parameters() \
                                              for p in self.up_layers]))
-        last_layer_scale=1e-5
+        last_layer_scale=1e-3
+        self.dense_up = nn.Linear(mlp_hidden[-1], np.prod(img_size)*3)
         with torch.no_grad():
+            self.dense_up.weight.mul_(last_layer_scale)
+            self.dense_up.bias.mul_(last_layer_scale)
             self.up_layers[-1].weight.mul_(last_layer_scale)
             self.up_layers[-1].bias.mul_(last_layer_scale)
-    def forward(self, x):
+    def down_net(self, x):
         d = x
         inds = []
         szs = []
@@ -223,6 +222,8 @@ class MomentumPredictor(nn.Module):
             else:
                 d = l(d)
             inds.append(ix)
+        return d, inds, szs
+    def up_net(self, d, inds, szs):
         for l, ix, sz in zip(self.up_layers, reversed(inds), reversed(szs)):
             if isinstance(l, nn.MaxUnpool3d):
                 d = l(d, ix, output_size=sz)
@@ -230,6 +231,13 @@ class MomentumPredictor(nn.Module):
                 d = l(d, output_size=sz)
             else:
                 d = l(d)
+        return d
+    def forward(self, x):
+        d, inds, szs = self.down_net(x)
+        sh = d.shape
+        d = self.mlp(d.view(x.shape[0],-1))#.view(*sh)
+        d = self.dense_up(d).view(x.shape[0],3,*self.img_size[2:])
+        #d = self.up_net(d, inds, szs)
         return d
 
     
@@ -239,7 +247,11 @@ def deep_lddmm_atlas(dataset,
         num_epochs=500,
         batch_size=2,
         reg_weight=.001,
+        closed_form_image=False,
+        image_update_freq=10, # how many iters between image updates
         momentum_net=None,
+        momentum_preconditioning=True,
+        lddmm_integration_steps=5,
         learning_rate_pose=1e-5,
         learning_rate_image=1e6):
     from torch.utils.data import DataLoader, TensorDataset
@@ -248,46 +260,82 @@ def deep_lddmm_atlas(dataset,
                             shuffle=True, num_workers=8, pin_memory=True)
     epoch_losses = []
     iter_losses = []
-    full_losses = []
     if momentum_net is None:
         momentum_net = MomentumPredictor(img_size=I.shape)
     momentum_net = momentum_net.to(I.device)
+    print(f"Momentum network has {sum([p.numel() for p in momentum_net.parameters()])} parameters")
     from torch.nn.functional import mse_loss
     pose_optimizer = torch.optim.Adam(momentum_net.parameters(),
                                       lr=learning_rate_pose,
-                                      weight_decay=1e-3)
+                                      weight_decay=1e-2)
     metric = lm.FluidMetric(fluid_params)
     epbar = tqdm(range(num_epochs), position=0)
     for epoch in epbar:
         epoch_loss = 0.0
-        iterbar = tqdm(dataloader, position=1)
-        for it, (ix, img) in enumerate(iterbar):
-            if I.grad is not None:
-                I.grad.detach_()
-                I.grad.zero_()
-            I.requires_grad_(True)
+        itbar = dataloader
+        if False:
+            itbar = tqdm(itbar, desc='iter', position=1)
+        if epoch > 1: # start using gradients for image after one epoch
+            closed_form_image = False
+        if closed_form_image:
+            splatI = torch.zeros_like(I)
+            splatw = torch.zeros_like(I)
+            splatI.requires_grad_(False)
+            splatw.requires_grad_(False)
+        if not closed_form_image and I.grad is not None:
+            I.grad.detach_()
+            I.grad.zero_()
+        I = I.detach()
+        for it, (ix, img) in enumerate(itbar):
+            I.requires_grad_(not closed_form_image)
             pose_optimizer.zero_grad()
             img = img.to(I.device)
             m = momentum_net(img)
-            h = lm.expmap(metric, m, num_steps=5)
+            if momentum_preconditioning:
+                m.register_hook(metric.flat)
+            h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
             Idef = lm.interp(I, h)
             reg_term = (metric.sharp(m)*m).mean()
             loss = mse_loss(Idef, img) + reg_weight*reg_term
             epoch_loss += loss.item()*img.shape[0]/len(dataset)
             iter_losses.append(loss.item())
-            iterbar.set_postfix(minibatch_loss=loss.item())
+            #itbar.set_postfix(minibatch_loss=loss.item())
             loss.backward()
+            pose_optimizer.step()
+            del loss, m, h, Idef, img
+        if closed_form_image:
+            if False:
+                sI, sw = lm.splat(img, h, dt=1.0, need_weights=True)
+                sI = sI.sum(dim=0)
+                sw = sw.sum(dim=0)
+                splatI.add_(1.0, sI)
+                splatw.add_(1.0, sw)
+                if it % image_update_freq == 0: 
+                    splatw = torch.clamp(splatw, min=1e-2)
+                    splatI.div_(splatw)
+                    I, splatI = splatI, I.detach()
+                    splatI.zero_()
+                    splatw.zero_()
+        else:
             with torch.no_grad():
                 I.add_(-learning_rate_image, I.grad)
-            pose_optimizer.step()
+        if closed_form_image:# and len(itbar) % image_update_freq != 0:
+            # once per epoch, pass back over data and update the base image
+            with torch.no_grad():
+                for _, img in dataloader:
+                    img = img.to(I.device)
+                    m = momentum_net(img)
+                    h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
+                    sI, sw = lm.splat(img, h, dt=1.0, need_weights=True)
+                    sI = sI.sum(dim=0)
+                    sw = sw.sum(dim=0)
+                    splatI.add_(1.0, sI)
+                    splatw.add_(1.0, sw)
+                splatw = torch.clamp(splatw, min=1e-1)
+                splatI.div_(splatw)
+                I, splatI = splatI, I.detach()
         epoch_losses.append(epoch_loss)
         epbar.set_postfix(epoch_loss=epoch_loss)
-        if False:
-            with torch.no_grad():
-                A, T = affine_net(J.view(J.shape[0],-1))
-                Idef = lm.affine_interp(I, A, T)
-                full_loss = mse_loss(Idef, J)
-                full_losses.append(full_loss)
-    return I.detach(), momentum_net, epoch_losses, iter_losses, full_losses
+    return I.detach(), momentum_net, epoch_losses, iter_losses
 
 

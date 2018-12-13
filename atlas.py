@@ -18,7 +18,7 @@ def affine_atlas(dataset,
                 I=None,
                 num_epochs=1000,
                 batch_size=5,
-                affine_steps=100,
+                affine_steps=1,
                 reg_weightA=0e1,
                 reg_weightT=0e1,
                 learning_rate_A=1e-3,
@@ -43,7 +43,9 @@ def affine_atlas(dataset,
     epbar = tqdm(range(num_epochs), desc='epoch', position=0)
     for epoch in epbar:
         epoch_loss = 0.0
-        itbar = tqdm(dataloader, desc='iter', position=1)
+        itbar = dataloader
+        #itbar = tqdm(dataloader, desc='iter', position=1)
+        image_optimizer.zero_grad()
         for it, (ix, img) in enumerate(itbar):
             A = As[ix,...].contiguous().to(device)
             T = Ts[ix,...].contiguous().to(device)
@@ -62,22 +64,19 @@ def affine_atlas(dataset,
             A.requires_grad_(False)
             T.requires_grad_(False)
             I.requires_grad_(True)
-            image_optimizer.zero_grad()
             Idef = lm.affine_interp(I, A+eye, T)
-            loss = mse_loss(Idef, img)
+            regtermA = mse_loss(A,A)
+            regtermT = mse_loss(T,T)
+            regloss = .5*reg_weightA*regtermA + .5*reg_weightT*regtermT
+            loss = (mse_loss(Idef, img)+regloss)*img.shape[0]/len(dataloader.dataset)
             loss.backward()
-            image_optimizer.step()
             loss.detach_()
-            with torch.no_grad():
-                regtermA = mse_loss(A,A)
-                regtermT = mse_loss(T,T)
-                regloss = .5*reg_weightA*regtermA + .5*reg_weightT*regtermT
-            itloss = loss.item() + regloss.item()
-            epoch_loss += itloss*img.shape[0]/len(dataloader.dataset)
-            iter_losses.append(itloss)
-            itbar.set_postfix(minibatch_loss=itloss)
+            epoch_loss += loss.item()
+            iter_losses.append(loss)
+            #itbar.set_postfix(minibatch_loss=itloss)
             As[ix,...] = A.detach().to(As.device)
             Ts[ix,...] = T.detach().to(Ts.device)
+        image_optimizer.step()
         losses.append(epoch_loss)
         epbar.set_postfix(epoch_loss=epoch_loss)
     return I.detach(), losses, iter_losses
