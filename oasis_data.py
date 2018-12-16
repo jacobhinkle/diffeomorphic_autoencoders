@@ -8,7 +8,7 @@ import numpy as np
 
 class OASISDataset(Dataset):
     def __init__(self,
-                 h5path='/mnt/USB/OASIS/OASIS3/oasis3.h5',
+                 h5path='data/oasis3.h5',
                  crop=None,
                  first=None,
                  pooling=None,

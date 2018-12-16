@@ -126,8 +126,9 @@ def deep_affine_atlas(dataset,
             Idef = lm.affine_interp(I, A+eye, T)
             regtermA = mse_loss(A,A)
             regtermT = mse_loss(T,T)
-            loss = mse_loss(Idef, img) + .5*reg_weightA*regtermA + .5*reg_weightT*regtermT
-            epoch_loss += loss.item()*img.shape[0]/len(dataloader.dataset)
+            loss = (mse_loss(Idef, img) + .5*reg_weightA*regtermA + .5*reg_weightT*regtermT) \
+                    * img.shape[0]/len(dataloader.dataset)
+            epoch_loss += loss.item()
             iter_losses.append(loss.item())
             #itbar.set_postfix(minibatch_loss=loss.item())
             loss.backward()
@@ -194,7 +195,6 @@ class MomentumPredictor(nn.Module):
                                              for p in self.down_layers]))
         Itest = torch.zeros(img_size, dtype=torch.float32)
         Itest,_,_ = self.down_net(Itest)
-        print(Itest.shape)
         n_features = Itest.view(1,-1).shape[1]
         del Itest
         print(f"n_features={n_features}")
@@ -203,7 +203,7 @@ class MomentumPredictor(nn.Module):
         self.up_layers = conv_up_from_spec(conv_layers, img_size, 3)
         self.up_layers_params = nn.ParameterList(chain(*[p.parameters() \
                                              for p in self.up_layers]))
-        last_layer_scale=1e-3
+        last_layer_scale=0e-5
         self.dense_up = nn.Linear(mlp_hidden[-1], np.prod(img_size)*3)
         with torch.no_grad():
             self.dense_up.weight.mul_(last_layer_scale)
@@ -266,8 +266,14 @@ def deep_lddmm_atlas(dataset,
     print(f"Momentum network has {sum([p.numel() for p in momentum_net.parameters()])} parameters")
     from torch.nn.functional import mse_loss
     pose_optimizer = torch.optim.Adam(momentum_net.parameters(),
-                                      lr=learning_rate_pose,
+                # below we roughly compensate for scaling the loss
+                # the goal is to have learning rates that are independent of
+                # number and size of minibatches, but it's tricky to accomplish
+                                      lr=learning_rate_pose*len(dataloader),
                                       weight_decay=1e-2)
+    image_optimizer = torch.optim.SGD([I],
+                                      lr=learning_rate_image,
+                                      weight_decay=0)
     metric = lm.FluidMetric(fluid_params)
     epbar = tqdm(range(num_epochs), position=0)
     for epoch in epbar:
@@ -283,9 +289,7 @@ def deep_lddmm_atlas(dataset,
             splatI.requires_grad_(False)
             splatw.requires_grad_(False)
         if not closed_form_image and I.grad is not None:
-            I.grad.detach_()
-            I.grad.zero_()
-        I = I.detach()
+            image_optimizer.zero_grad()
         for it, (ix, img) in enumerate(itbar):
             I.requires_grad_(not closed_form_image)
             pose_optimizer.zero_grad()
@@ -295,9 +299,11 @@ def deep_lddmm_atlas(dataset,
                 m.register_hook(metric.flat)
             h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
             Idef = lm.interp(I, h)
-            reg_term = (metric.sharp(m)*m).mean()
-            loss = mse_loss(Idef, img) + reg_weight*reg_term
-            epoch_loss += loss.item()*img.shape[0]/len(dataset)
+            v = metric.sharp(m)
+            reg_term = (v*m).mean()
+            loss = (mse_loss(Idef, img) + reg_weight*reg_term) \
+                    * img.shape[0]/len(dataloader.dataset)
+            epoch_loss += loss.item()
             iter_losses.append(loss.item())
             #itbar.set_postfix(minibatch_loss=loss.item())
             loss.backward()
@@ -317,8 +323,7 @@ def deep_lddmm_atlas(dataset,
                     splatI.zero_()
                     splatw.zero_()
         else:
-            with torch.no_grad():
-                I.add_(-learning_rate_image, I.grad)
+            image_optimizer.step()
         if closed_form_image:# and len(itbar) % image_update_freq != 0:
             # once per epoch, pass back over data and update the base image
             with torch.no_grad():

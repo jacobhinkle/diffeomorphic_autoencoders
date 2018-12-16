@@ -47,8 +47,8 @@ def affine_atlas(dataset,
         #itbar = tqdm(dataloader, desc='iter', position=1)
         image_optimizer.zero_grad()
         for it, (ix, img) in enumerate(itbar):
-            A = As[ix,...].contiguous().to(device)
-            T = Ts[ix,...].contiguous().to(device)
+            A = As[ix,...].detach().to(device)
+            T = Ts[ix,...].detach().to(device)
             img = img.to(device)
             img.requires_grad_(False)
             #A, T, losses_match = affine_matching(I,
@@ -63,19 +63,24 @@ def affine_atlas(dataset,
             #                                     progress_bar=False)
             A.requires_grad_(True)
             T.requires_grad_(True)
+            if A.grad is not None:
+                A.grad.zero_()
+            if T.grad is not None:
+                T.grad.zero_()
             I.requires_grad_(True)
             Idef = lm.affine_interp(I, A+eye, T)
             regtermA = mse_loss(A,A)
             regtermT = mse_loss(T,T)
             regloss = .5*reg_weightA*regtermA + .5*reg_weightT*regtermT
+            # average over entire dataset for loss, since image updates once per epoch
             loss = (mse_loss(Idef, img)+regloss)*img.shape[0]/len(dataloader.dataset)
             loss.backward()
             loss.detach_()
             epoch_loss += loss.item()
             iter_losses.append(loss)
             with torch.no_grad():
-                A.add_(-learning_rate_A*len(dataloader.dataset)/img.shape[0], A.grad)
-                T.add_(-learning_rate_T*len(dataloader.dataset)/img.shape[0], T.grad)
+                A.add_(-learning_rate_A*len(dataloader.dataset), A.grad)
+                T.add_(-learning_rate_T*len(dataloader.dataset), T.grad)
             #itbar.set_postfix(minibatch_loss=itloss)
             As[ix,...] = A.detach().to(As.device)
             Ts[ix,...] = T.detach().to(Ts.device)
@@ -95,6 +100,7 @@ def lddmm_atlas(dataset,
         learning_rate_image = 1e4,
         fluid_params=[0.1,0.,.01],
         device='cuda',
+        momentum_preconditioning=True,
         momentum_pattern='oasis_momenta/momentum_{}.pth'):
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, pin_memory=True, shuffle=False)
     if I is None:
@@ -141,13 +147,17 @@ def lddmm_atlas(dataset,
             if m.grad is not None:
                 m.grad.zero_()
             h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
-            Idef = lm.interp(I, m)
+            Idef = lm.interp(I, h)
             v = metric.sharp(m)
             regterm = (v*m).mean()
             loss = (mse_loss(Idef, img) + reg_weight*regterm)*img.shape[0]/len(dataloader.dataset)
             loss.backward()
             with torch.no_grad():
-                m.add_(-learning_rate_pose*len(dataloader.dataset)/img.shape[0], metric.flat(m.grad))
+                p = m.grad
+                if momentum_preconditioning:
+                    p = metric.flat(p)
+                m.add_(-learning_rate_pose*len(dataloader.dataset), p)
+                del p
             epoch_loss += loss.item()
             iter_losses.append(loss.item())
             #itbar.set_postfix(minibatch_loss=loss.item())

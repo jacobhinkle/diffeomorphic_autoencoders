@@ -5,9 +5,9 @@ import numpy as np
 import os
 from tqdm import tqdm
 
-fs_dir = '/mnt/USB/OASIS/OASIS3'
+fs_dir = '.'
 skullstripped_dir = fs_dir + '/skullstripped'
-h5_file = fs_dir + '/oasis3_meta.h5'
+h5_file = fs_dir + '/oasis3.h5'
 imgs = []
 allfiles = sorted(os.listdir(skullstripped_dir))
 ssfiles = []

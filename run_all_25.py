@@ -10,6 +10,10 @@ torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
 from oasis_data import *
+oasis_ds = OASISDataset(crop=crop,
+                        first=25,
+                        pooling=ds_pooling,
+                        one_scan_per_subject=one_scan_per_subject)
 from atlas import *
 from deepatlas import *
 
@@ -35,9 +39,9 @@ if not os.path.isfile(convaffinefile): # compute affine atlas
         I=Iavg, As=As, Ts=Ts,
 	affine_steps=1,
         num_epochs=1000,
-        learning_rate_A=2e-4,
-        learning_rate_T=2e-3,
-        learning_rate_I=1e4,
+        learning_rate_A=1e-4,
+        learning_rate_T=1e-2,
+        learning_rate_I=1e3,
         batch_size=50)
     # save result
     torch.save(res, convaffinefile)
@@ -82,6 +86,7 @@ if not os.path.isfile(stdfile): # standardize data
 oasis_ds_std = OASISDataset(h5path=stdfile)
 
 fluid_params = [.1,0,.01]
+torch.save(fluid_params, f'fluidparams_{suffix}.pth')
 convlddmmfile = f'convlddmm_{suffix}.pth'
 if not os.path.isfile(convlddmmfile): # conventional lddmm atlas
     print("Conventional LDDMM atlas building")
@@ -90,9 +95,10 @@ if not os.path.isfile(convlddmmfile): # conventional lddmm atlas
                                           fluid_params=fluid_params,
                                           learning_rate_pose=1e-4,
                                           learning_rate_image=1e4,
+                                          reg_weight=1e2,
                                           momentum_preconditioning=False,
                                           batch_size=10,
-                                          num_epochs=100)
+                                          num_epochs=500)
     torch.save(res, convlddmmfile)
 Ilddmm, mom_lddmm, epoch_losses, iter_losses = torch.load(convlddmmfile)
 
@@ -102,16 +108,14 @@ if not os.path.isfile(deeplddmmfile): # deep lddmm atlas
     res = \
         deep_lddmm_atlas(oasis_ds_std,
                      I=I_deepaffine.clone().to('cuda'),
-                     #I=I_deeplddmm_ft.clone(),
-                     num_epochs=100,
+                     num_epochs=500,
                      batch_size=10,
                      closed_form_image=False,
                      image_update_freq=100,
                      reg_weight=1e2,
-                     #momentum_net=copy.deepcopy(mom_net_ft),
                      momentum_preconditioning=False,
-                     learning_rate_pose=1e-6,
+                     learning_rate_pose=1e-5,
                      learning_rate_image=1e4,
                      fluid_params=fluid_params)
     torch.save(res, deeplddmmfile)
-I_deeplddmm_ft, mom_net_ft, epoch_losses_deeplddmm_ft, iter_losses_deeplddmm_ft = torch.load(deeplddmmfile)
+I_deeplddmm, mom_net, epoch_losses_deeplddmm, iter_losses_deeplddmm = torch.load(deeplddmmfile)
