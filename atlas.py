@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
 from torch.nn.functional import mse_loss
 from torch.utils.data import Dataset, DataLoader
@@ -17,7 +19,7 @@ def affine_atlas(dataset,
                  Ts,
                 I=None,
                 num_epochs=1000,
-                batch_size=5,
+                batch_size=50,
                 affine_steps=1,
                 reg_weightA=0e1,
                 reg_weightT=0e1,
@@ -89,8 +91,16 @@ def affine_atlas(dataset,
         epbar.set_postfix(epoch_loss=epoch_loss)
     return I.detach(), losses, iter_losses
 
+class DenseInterp(nn.Module):
+    """Very simple module wrapper that enables simple data parallel"""
+    def __init__(self, I0):
+        super(DenseInterp, self).__init__()
+        self.I = nn.Parameter(I0)
+    def forward(self, h):
+        return lm.interp(self.I, h)
+
 def lddmm_atlas(dataset,
-        I=None,
+        I0=None,
         num_epochs=500,
         batch_size=10,
         lddmm_steps=1,
@@ -101,53 +111,49 @@ def lddmm_atlas(dataset,
         fluid_params=[0.1,0.,.01],
         device='cuda',
         momentum_preconditioning=True,
-        momentum_pattern='oasis_momenta/momentum_{}.pth'):
-    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, pin_memory=True, shuffle=False)
-    if I is None:
+        momentum_pattern='oasis_momenta/momentum_{}.pth',
+        gpu=None,
+        world_size=1,
+        rank=1):
+    if world_size > 1:
+        sampler = DistributedSampler(dataset, 
+                num_replicas=world_size,
+                rank=rank)
+    else:
+        sampler = None
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size,
+            num_workers=8, pin_memory=True, shuffle=False)
+    if I0 is None:
         # initialize base image to mean
-        I = batch_average(dataloader, dim=0)
-    I = I.to(device).view(1,1,*I.squeeze().shape)
-    image_optimizer = torch.optim.SGD([I],
+        I0 = batch_average(dataloader, dim=0)
+    I0 = I0.view(1,1,*I0.squeeze().shape)
+    I = DenseInterp(I0)
+    if gpu is not None:
+        I = DistributedDataParallel(I, device_ids=[gpu], output_device=gpu)
+        I = I.to(f'cuda:{gpu}')
+    else:
+        I = I.to(device)
+    image_optimizer = torch.optim.SGD(I.parameters(),
                                       lr=learning_rate_image,
                                       weight_decay=0)
     metric = lm.FluidMetric(fluid_params)
     losses = []
     iter_losses = []
-    epbar = tqdm(range(num_epochs), desc='epoch', position=0)
-    ms = torch.zeros(len(dataset),3,*I.shape[-3:], dtype=I.dtype).pin_memory()
+    epbar = tqdm(range(num_epochs), desc='epoch')
+    ms = torch.zeros(len(dataset),3,*I0.shape[-3:], dtype=I0.dtype).pin_memory()
     for epoch in epbar:
         epoch_loss = 0.0
         itbar = dataloader
-        if False:
-            itbar = tqdm(itbar, desc='iter', position=1)
         image_optimizer.zero_grad()
-        I.requires_grad_(True)
         for it, (ix, img) in enumerate(itbar):
-            if False:
-                m = torch.zeros(img.shape[0],3,*I.shape[-3:], dtype=I.dtype)
-                for i,ii in enumerate(ix):
-                    try:
-                        m[i,...] = torch.load(momentum_pattern.format(ii))
-                    except FileNotFoundError:
-                        pass
-            else:
-                m = ms[ix,...].detach()
+            m = ms[ix,...].detach()
             m = m.to(device)
             img = img.to(device)
-            #I.requires_grad_(False)
-            #img.requires_grad_(False)
-            #m, losses_match = lddmm_matching(I, img,
-            #                                 m=m,
-            #                                 lddmm_steps=lddmm_steps,
-            #                                 fluid_params=fluid_params,
-            #                                 learning_rate_pose=learning_rate_pose,
-            #                                 reg_weight=reg_weight,
-            #                                 progress_bar=False)
             m.requires_grad_(True)
             if m.grad is not None:
                 m.grad.zero_()
             h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
-            Idef = lm.interp(I, h)
+            Idef = I(h)
             v = metric.sharp(m)
             regterm = (v*m).mean()
             loss = (mse_loss(Idef, img) + reg_weight*regterm)*img.shape[0]/len(dataloader.dataset)
@@ -169,5 +175,5 @@ def lddmm_atlas(dataset,
         image_optimizer.step()
         losses.append(epoch_loss)
         epbar.set_postfix(epoch_loss=epoch_loss)
-    return I.detach(), ms.detach(), losses, iter_losses
+    return I.I.detach(), ms.detach(), losses, iter_losses
 

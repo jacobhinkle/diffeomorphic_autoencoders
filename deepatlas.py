@@ -186,7 +186,7 @@ class MomentumPredictor(nn.Module):
                               (5,4,2),
                               (5,2,2),
                               (3,1,1)],
-                 mlp_hidden=[256,64]):
+                 mlp_hidden=[256,256,256]):
         super(MomentumPredictor, self).__init__()
         self.img_size = img_size
         self.down_layers = conv_down_from_spec(conv_layers, img_size)

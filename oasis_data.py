@@ -26,6 +26,8 @@ class OASISDataset(Dataset):
         self.first = first
         self.pooling = pooling
         self.one_scan_per_subject = one_scan_per_subject
+        if pooling is not None:
+            raise Exception("Pooling inside the OASIS dataloader is deprecated.  See OASISDownscaling.ipynb for examples of how to pre-pool the data.")
         # build list of indices to use
         if one_scan_per_subject:
             import pandas as pd
@@ -89,7 +91,7 @@ else:
     crop = None
 ds_first = 2000
 one_scan_per_subject = True
-ds_pooling = 2
+ds_pooling = None
 oasis_ds = OASISDataset(crop=crop,
                         first=ds_first,
                         pooling=ds_pooling,

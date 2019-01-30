@@ -63,21 +63,18 @@ def lddmm_matching( I,
                     lddmm_steps=1000,
                     lddmm_integration_steps=10,
                     reg_weight=1e-1,
-                    diffeo_scale=None,
                     learning_rate_pose = 2e-2,
                     fluid_params=[1.0,.1,.01],
                     progress_bar=True
                   ):
     """Matching image I to J via LDDMM"""
-    if diffeo_scale is not None:
-        defsh = [I.shape[0], 3] + [s//diffeo_scale for s in I.shape[2:]]
-    else:
-        defsh = [I.shape[0], 3] + list(I.shape[2:])
     if m is None:
+        defsh = [I.shape[0], 3] + list(I.shape[2:])
         m = torch.zeros(defsh, dtype=I.dtype).to(I.device)
-    else:
-        assert m.shape != defsh
+    do_regridding = m.shape[2:] != I.shape[2:]
     J = J.to(I.device)
+    matchterms = []
+    regterms = []
     losses = []
     metric = lm.FluidMetric(fluid_params)
     m.requires_grad_()
@@ -89,22 +86,28 @@ def lddmm_matching( I,
             m.grad.zero_()
         m.requires_grad_()
         h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
-        if diffeo_scale is not None:
+        if do_regridding is not None:
             h = lm.regrid(h, shape=I.shape[2:], displacement=True)
         Idef = lm.interp(I, h)
-        loss = mse_loss(Idef, J)
+        regterm = (metric.sharp(m)*m).mean()
+        matchterm = mse_loss(Idef, J)
+        matchterms.append(matchterm.detach().item())
+        regterms.append(regterm.detach().item())
+        loss = matchterm + reg_weight*regterm
         loss.backward()
         loss.detach_()
         with torch.no_grad():
+            #v = metric.sharp(m)
+            #regterm = (v*m).mean()#.detach()
+            #del v
+            #losses.append(loss.detach()+ .5*reg_weight*regterm)
+            losses.append(loss.detach())
             p = metric.flat(m.grad).detach()
-            v = metric.sharp(m)
-            regterm = (v*m).sum().detach()
-            losses.append(loss.detach()+ .5*reg_weight*regterm)
             if torch.isnan(losses[-1]).item():
                 print(f"loss is NaN at iter {mit}")
                 break
-            if mit > 0 and losses[-1].item() > losses[-2].item():
-                print(f"loss increased at iter {mit}")
-            p.add_(reg_weight, m)
+            #if mit > 0 and losses[-1].item() > losses[-2].item():
+            #    print(f"loss increased at iter {mit}")
+            #p.add_(reg_weight/np.prod(m.shape[1:]), m)
             m.add_(-learning_rate_pose, p)
-    return m.detach(), [l.item() for l in losses]
+    return m.detach(), [l.item() for l in losses], matchterms, regterms
