@@ -1,0 +1,17 @@
+#!/bin/bash -l
+
+#BSUB -P MED107
+#BSUB -J midl_all
+#BSUB -e joblogs/{{jobname}}.%J.e
+#BSUB -o joblogs/{{jobname}}.%J.o
+#BSUB -W 1:30
+#BSUB -nnodes {{nnodes}}
+
+# node with rank 0 must be master
+MASTER_HOST=$(echo "$LSB_MCPU_HOSTS" | awk '{print $3}')
+# use infiniband. On summit this means just appending "ib" to the hostname
+MASTER_HOST=${MASTER_HOST}ib
+MASTER_ADDR=$(getent hosts | awk "{if (\$3 == \"${MASTER_HOST}\") print \$1}")
+
+jsrun -n{{nnodes}} -a1 -g6 -c42 /gpfs/alpine/proj-shared/med107/4jh/midl/diffeomorphic_autoencoders/run.sh $MASTER_ADDR {{nfolds}} {{fold}} {{script}}
+
