@@ -8,21 +8,27 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--num_folds','-k', default=5, type=int, help="Number of cross-validation folds")
 parser.add_argument('--fold','-f', default=0, type=int, help="Which fold to process (zero-indexed)")
+parser.add_argument('--node_rank','-r', default=0, type=int, help="Rank of main process on this node")
 parser.add_argument('--local_rank','-g', default=None, type=int, help="Local rank, i.e. which GPU to use")
-parser.add_argument('--rank', default=None, type=int, help="Global rank of this process")
 parser.add_argument('--world_size','-w', default=1, type=int, help="Total number of processes launched")
+parser.add_argument('--nprocs_per_node','-n', default=1, type=int, help="Total number of processes launched on each node")
 args = parser.parse_args()
 
+
 if args.local_rank is not None:
+    gpu = args.local_rank
     torch.cuda.set_device(args.local_rank)
-if args.rank is None:
-    rank = args.local_rank
 else:
-    rank = args.rank
+    gpu = 0
+# compute overall rank
+rank = args.node_rank*args.nprocs_per_node + args.local_rank
 if args.world_size is not 1:
     torch.distributed.init_process_group(backend='nccl',
             world_size=args.world_size,
             init_method='env://')
+loc = f'cuda:{gpu}'
+
+print(f"World size: {args.world_size} Local rank: {args.local_rank} Gpu: {gpu} Node Rank: {args.node_rank} NPN: {args.nprocs_per_node} Global Rank: {rank}")
 
 # try to be as reproducible as possible. Due to atomics used in backpropagation,
 # even this is not enough for bit-for-bit reproducibility
@@ -41,12 +47,16 @@ one_scan_per_subject = False
 s = 2
 prefix = f'output/oasis3_downscale{s}_cv/{num_folds}/{fold}/'
 os.makedirs(prefix, exist_ok=True)
-h5path = f'data/oasis3_downscale{s}_cv/{num_folds}/train{fold}.h5'
+datadir = f'data/oasis3_downscale{s}_cv/{num_folds}'
 crop //= s
-oasis_ds = OASISDataset(crop=crop,
+def get_dataset(split):
+    h5path = f'{datadir}/{split}{fold}.h5'
+    return OASISDataset(crop=crop,
                         h5path=h5path,
                         pooling=ds_pooling,
                         one_scan_per_subject=one_scan_per_subject)
+oasis_ds = get_dataset('train')
+oasis_test_ds = get_dataset('test')
 l = len(oasis_ds)
 sz = oasis_ds[0][1].shape[2]
 suffix = f'crop{docrop}_oneper{one_scan_per_subject}_{sz}_{l}'
@@ -57,8 +67,8 @@ avgfile = f'{prefix}oasisavg_{suffix}.pth'
 if not os.path.isfile(avgfile):
     print("Voxel averaging")
     Iavg = batch_average(DataLoader(oasis_ds, batch_size=200, num_workers=8, pin_memory=True, shuffle=False), dim=0)
-    torch.save(Iavg, avgfile)
-Iavg = torch.load(avgfile)
+    if rank == 0: torch.save(Iavg, avgfile)
+Iavg = torch.load(avgfile, map_location=loc)
 
 convaffinefile = f'{prefix}convaffine_{suffix}.pth'
 if not os.path.isfile(convaffinefile): # compute affine atlas
@@ -75,8 +85,9 @@ if not os.path.isfile(convaffinefile): # compute affine atlas
         learning_rate_I=1e4,
         batch_size=50)
     # save result
-    torch.save(res, convaffinefile)
-Iaffine, epoch_losses_affine, iter_losses_affine = torch.load(convaffinefile)
+    if rank == 0: torch.save(res, convaffinefile)
+Iaffine, epoch_losses_affine, iter_losses_affine = torch.load(convaffinefile,
+        map_location=loc)
 Iaffine = Iaffine.to('cuda')
 
 deepaffinefile = f'{prefix}deepaffine_{suffix}.pth'
@@ -89,10 +100,10 @@ if not os.path.isfile(deepaffinefile): # compute deep affine atlas
                       learning_rate_image=1e4,
                       num_epochs=1000,
                       batch_size=50)
-    torch.save(res, deepaffinefile)
+    if rank == 0: torch.save(res, deepaffinefile)
 I_deepaffine, affine_net, epoch_losses_deepaffine, full_losses_deepaffine, \
             iter_losses_deepaffine \
-        = torch.load(deepaffinefile)
+        = torch.load(deepaffinefile, map_location=loc)
 I_deepaffine = I_deepaffine.to('cuda')
 
 stdfile = f'{prefix}deepaffinestd_{suffix}.h5'
@@ -121,23 +132,48 @@ oasis_ds_std = OASISDataset(crop=None,
                         one_scan_per_subject=False)
 
 fluid_params = [.1,0,.01]
-torch.save(fluid_params, f'fluidparams_{suffix}.pth')
+if rank == 0: torch.save(fluid_params, f'{prefix}fluidparams_{suffix}.pth')
 convlddmmfile = f'{prefix}convlddmm_{suffix}.pth'
 if not os.path.isfile(convlddmmfile): # conventional lddmm atlas
     print("Conventional LDDMM atlas building")
     res = lddmm_atlas(dataset=oasis_ds_std,
                                           I0=I_deepaffine.clone().to('cuda'),
                                           fluid_params=fluid_params,
-                                          learning_rate_pose=1e-4,
-                                          learning_rate_image=1e2,
+                                          learning_rate_pose=1e-3,
+                                          learning_rate_image=5e4,
+                                          reg_weight=1e2,
                                           momentum_preconditioning=False,
-                                          batch_size=20,
+                                          batch_size=30,
                                           num_epochs=500,
-                                          gpu=args.local_rank,
+                                          gpu=gpu,
                                           world_size=args.world_size,
                                           rank=rank)
-    torch.save(res, convlddmmfile)
-Ilddmm, mom_lddmm, epoch_losses, iter_losses = torch.load(convlddmmfile)
+    if rank == 0: torch.save(res, convlddmmfile)
+    del res
+Ilddmm, mom_lddmm, epoch_losses, iter_losses = torch.load(convlddmmfile,
+        map_location=loc)
+# On the test set, use same atlas-building code but with zero learning rate for
+# the image
+convlddmmtestfile = f'{prefix}convlddmm_test_{suffix}.pth'
+if not os.path.isfile(convlddmmtestfile): # conventional lddmm atlas
+    print("Conventional LDDMM Test")
+    res = lddmm_atlas(dataset=oasis_ds_std,
+                                          I0=Ilddmm.clone(),
+                                          fluid_params=fluid_params,
+                                          learning_rate_pose=1e-3,
+                                          learning_rate_image=0e4,
+                                          momentum_preconditioning=False,
+                                          reg_weight=1e2,
+                                          batch_size=30,
+                                          num_epochs=500,
+                                          gpu=gpu,
+                                          world_size=args.world_size,
+                                          rank=rank)
+    if rank == 0: torch.save(res, convlddmmtestfile)
+    del res
+#Ilddmm, mom_lddmm, epoch_losses, iter_losses = torch.load(convlddmmtestfile,
+        #map_location=loc)
+
 
 deeplddmmfile = f'{prefix}deeplddmm_{suffix}.pth'
 if not os.path.isfile(deeplddmmfile): # deep lddmm atlas
@@ -155,6 +191,42 @@ if not os.path.isfile(deeplddmmfile): # deep lddmm atlas
                      momentum_preconditioning=False,
                      learning_rate_pose=1e-6,
                      learning_rate_image=1e4,
-                     fluid_params=fluid_params)
-    torch.save(res, deeplddmmfile)
-I_deeplddmm_ft, mom_net_ft, epoch_losses_deeplddmm_ft, iter_losses_deeplddmm_ft = torch.load(deeplddmmfile)
+                     fluid_params=fluid_params,
+                     gpu=gpu,
+                     world_size=args.world_size,
+                     rank=rank)
+    if rank == 0: torch.save(res, deeplddmmfile)
+I_deeplddmm, mom_net, epoch_losses_deeplddmm, iter_losses_deeplddmm \
+     = torch.load(deeplddmmfile, map_location=loc)
+
+deeplddmmtestfile = f'{prefix}deeplddmm_test_{suffix}.pth'
+if not os.path.isfile(deeplddmmtestfile): # deep lddmm atlas
+    print("Deep LDDMM atlas building TEST")
+    # manually do testing, just compute the regularization and image MSE here
+    if world_size > 1:
+        sampler = DistributedSampler(dataset, 
+                num_replicas=args.world_size,
+                rank=gpu)
+    else:
+        sampler = None
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size,
+            num_workers=8, pin_memory=True, shuffle=False)
+    with torch.no_grad():
+        deeplddmm_test_loss = 0.0
+        itbar = enumerate(dataloader)
+        if rank == 0:
+            itbar = tqdm(itbar, desc='minibatch')
+        for it, (ix, img) in enumerate(itbar):
+            img = img.to(I_deeplddmm.device)
+            m = momentum_net(img)
+            h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
+            Idef = lm.interp(I_deeplddmm, h)
+            v = metric.sharp(m)
+            reg_term = (v*m).mean()
+            loss = (mse_loss(Idef, img) + reg_weight*reg_term) \
+                    * img.shape[0]/len(dataloader.dataset)
+            if args.world_size > 1:
+                all_reduce(loss)
+                loss = loss/args.world_size
+            deeplddmm_test_loss += loss.item()
+    if rank == 0: torch.save((deeplddmm_test_loss,), deeplddmmtestfile)

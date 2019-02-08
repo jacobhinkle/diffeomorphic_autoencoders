@@ -86,8 +86,10 @@ def affine_atlas(dataset,
                 A.requires_grad_(True)
                 T.requires_grad_(True)
                 if A.grad is not None:
+                    A.grad.detach_()
                     A.grad.zero_()
                 if T.grad is not None:
+                    T.grad.detach_()
                     T.grad.zero_()
                 I.requires_grad_(True)
                 Idef = lm.affine_interp(I, A+eye, T)
@@ -122,7 +124,7 @@ def affine_atlas(dataset,
         image_optimizer.step()
         losses.append(epoch_loss.item())
         if rank == 0: epbar.set_postfix(epoch_loss=epoch_loss.item())
-    return I.detach(), losses, iter_losses
+    return I.detach(), As, Ts, losses, iter_losses
 
 class DenseInterp(nn.Module):
     """Very simple module wrapper that enables simple data parallel"""
@@ -173,6 +175,7 @@ def lddmm_atlas(dataset,
                                       weight_decay=0)
     metric = lm.FluidMetric(fluid_params)
     losses = []
+    reg_terms = []
     iter_losses = []
     epbar = range(num_epochs)
     if rank == 0:
@@ -180,6 +183,7 @@ def lddmm_atlas(dataset,
     ms = torch.zeros(len(dataset),3,*I0.shape[-3:], dtype=I0.dtype).pin_memory()
     for epoch in epbar:
         epoch_loss = 0.0
+        epoch_reg_term = 0.0
         itbar = dataloader
         I.requires_grad_(True)
         image_optimizer.zero_grad()
@@ -193,13 +197,14 @@ def lddmm_atlas(dataset,
                 # enables taking multiple LDDMM step per image update
                 m.requires_grad_(True)
                 if m.grad is not None:
+                    m.grad.detach_()
                     m.grad.zero_()
                 h = lm.expmap(metric, m, num_steps=lddmm_integration_steps)
                 #Idef = I(h)
                 Idef = lm.interp(I, h)
                 v = metric.sharp(m)
-                regterm = (v*m).mean()
-                loss = (mse_loss(Idef, img, reduction='sum') + reg_term) \
+                regterm = reg_weight*(v*m).sum()
+                loss = (mse_loss(Idef, img, reduction='sum') + regterm) \
                         / (img.numel())
                 loss.backward()
                 # this makes it so that we can reduce the loss and eventually get
@@ -210,24 +215,31 @@ def lddmm_atlas(dataset,
                     if momentum_preconditioning:
                         p = metric.flat(p)
                     m.add_(-learning_rate_pose, p)
+                    if world_size > 1:
+                        all_reduce(li)
                     iter_losses.append(li.item())
                     m = m.detach()
                     del p
             with torch.no_grad():
                 epoch_loss += li
+                ri = (regterm*(img.shape[0]/(img.numel()*len(dataloader.dataset)))).detach()
+                epoch_reg_term += ri
                 ms[ix,...] = m.detach().cpu()
             del m, h, Idef, v, loss, regterm, img
         with torch.no_grad():
             if world_size > 1:
                 all_reduce(epoch_loss)
+                all_reduce(epoch_reg_term)
                 all_reduce(I.grad)
                 I.grad = I.grad/world_size
             # average over iterations
             I.grad = I.grad / len(dataloader)
         image_optimizer.step()
         losses.append(epoch_loss.item())
+        reg_terms.append(epoch_reg_term.item())
         if rank == 0:
-            epbar.set_postfix(epoch_loss=epoch_loss)
+            epbar.set_postfix(epoch_loss=epoch_loss.item(),
+                    epoch_reg=epoch_reg_term.item())
     #return I.state_dict()['I'].detach(), ms.detach(), losses, iter_losses
     return I.detach(), ms.detach(), losses, iter_losses
 

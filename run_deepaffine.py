@@ -50,7 +50,7 @@ if False:
                               learning_rate_image=0e4,
                               reg_weightA=reg_weightA,
                               reg_weightT=reg_weightT,
-                              dropout=dropout,
+                              dropout=0,
                               num_epochs=1,
                               batch_size=batch_size,
                               gpu=gpu,

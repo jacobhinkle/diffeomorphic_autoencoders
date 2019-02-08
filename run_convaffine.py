@@ -21,9 +21,9 @@ if not os.path.isfile(convaffinefile): # compute affine atlas
         I=Iavg, As=As, Ts=Ts,
         affine_steps=1,
         num_epochs=250,
-        learning_rate_A=1e-3,
-        learning_rate_T=1e-2,
-        learning_rate_I=2e4,
+        learning_rate_A=1e-4,
+        learning_rate_T=1e-3,
+        learning_rate_I=1e3,
         reg_weightA=reg_weightA,
         reg_weightT=reg_weightT,
         batch_size=8,
@@ -32,23 +32,25 @@ if not os.path.isfile(convaffinefile): # compute affine atlas
         rank=rank)
     # save result
     if rank == 0: torch.save(res, convaffinefile)
+else:
+    res = torch.load(convaffinefile, map_location='cpu')
+I_affine, As_train, Ts_train, _, _ = res
 barrier()
 
 # On the test set, use same atlas-building code but with zero learning rate for
 # the image
 convaffinetestfile = f'{prefix}convaffine_test_{suffix}.pth'
 if not os.path.isfile(convaffinetestfile): # conventional lddmm atlas
-    I_affine, _, _ = torch.load(convaffinefile, map_location='cpu')
     print("Conventional Affine Test")
-    As = torch.zeros((len(oasis_test_ds),3,3), dtype=torch.float32).to('cpu')
-    Ts = torch.zeros((len(oasis_test_ds),3), dtype=torch.float32).to('cpu')
+    As_test = torch.zeros((len(oasis_test_ds),3,3), dtype=torch.float32).to('cpu')
+    Ts_test = torch.zeros((len(oasis_test_ds),3), dtype=torch.float32).to('cpu')
     res = affine_atlas(
         dataset=oasis_test_ds,
-        I=I_affine, As=As, Ts=Ts,
+        I=I_affine, As=As_test, Ts=Ts_test,
         affine_steps=250,
         num_epochs=1,
-        learning_rate_A=1e-3,
-        learning_rate_T=1e-2,
+        learning_rate_A=1e-4,
+        learning_rate_T=1e-3,
         learning_rate_I=0e5,
         reg_weightA=reg_weightA,
         reg_weightT=reg_weightT,
@@ -57,4 +59,31 @@ if not os.path.isfile(convaffinetestfile): # conventional lddmm atlas
         world_size=args.world_size,
         rank=rank)
     if rank == 0: torch.save(res, convaffinetestfile)
-    del res
+else:
+    res = torch.load(convaffinetestfile, map_location='cpu')
+barrier()
+_, As_test, Ts_test, _, _ = res
+
+if rank == 0:
+    for ds, stdfile, As, Ts in [(oasis_ds, f'{prefix}convaffinestd_{suffix}.h5', As_train, Ts_train),
+            (oasis_test_ds, f'{prefix}convaffinestd_test_{suffix}.h5', As_test, Ts_test)]:
+        As = As.to(loc)
+        Ts = Ts.to(loc)
+        if not os.path.isfile(stdfile): # standardize data
+            print(f"Creating standardized dataset in file {stdfile}")
+            eye = torch.eye(3).view(1,3,3).type(Iavg.dtype).to(loc)
+            with h5py.File(stdfile, 'w') as f:
+                f.create_dataset('atlas', data=I_affine.cpu().numpy())
+                d = f.create_dataset('skullstripped',
+                        (len(ds), *I_affine.shape[2:]),
+                        dtype=np.float32,
+                        compression='lzf',
+                        chunks=(1, *I_affine.shape[2:]))
+                with torch.no_grad():
+                    for ii, (i, J) in tqdm(enumerate(ds)):
+                        i, J = ds[ii]
+                        J = J.unsqueeze(1).to(loc)
+                        A, T = As[[i],...].to(loc), Ts[[i],...].to(loc)
+                        Ainv, Tinv = lm.affine_inverse(A+eye, T)
+                        Jdef = lm.affine_interp(J, Ainv, Tinv).cpu()
+                        d[i,...] = Jdef.numpy()

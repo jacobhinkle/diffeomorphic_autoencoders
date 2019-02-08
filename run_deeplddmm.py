@@ -6,11 +6,11 @@ from cmdline import *
 from atlas import *
 
 oasis_ds_std = OASISDataset(crop=None,
-                        h5path=f'{prefix}deepaffinestd_{suffix}.h5',
+                        h5path=f'{prefix}convaffinestd_{suffix}.h5',
                         pooling=None,
                         one_scan_per_subject=False)
 oasis_ds_test_std = OASISDataset(crop=None,
-                        h5path=f'{prefix}deepaffinestd_test_{suffix}.h5',
+                        h5path=f'{prefix}convaffinestd_test_{suffix}.h5',
                         pooling=None,
                         one_scan_per_subject=False)
 
@@ -19,9 +19,10 @@ I_deepaffine, _, _, _, _, _ \
         = torch.load(deepaffinefile, map_location='cpu')
 
 fluid_params = [.1,0,.01]
-reg_weight = 1e2
+reg_weight = 1e4
 lddmm_integration_steps = 5
-batch_size = 2
+batch_size = 8
+dropout=0.
 deeplddmmfile = f'{prefix}deeplddmm_{suffix}.pth'
 if not os.path.isfile(deeplddmmfile): # deep lddmm atlas
     print("Deep LDDMM atlas building")
@@ -29,16 +30,16 @@ if not os.path.isfile(deeplddmmfile): # deep lddmm atlas
         deep_lddmm_atlas(oasis_ds_std,
                      I0=I_deepaffine,
                      #I=I_deeplddmm_ft.clone(),
-                     num_epochs=500,
+                     num_epochs=1000,
                      batch_size=batch_size,
                      closed_form_image=False,
-                     image_update_freq=100,
                      reg_weight=reg_weight,
+                     dropout=dropout,
                      #momentum_net=copy.deepcopy(mom_net_ft),
                      momentum_preconditioning=False,
                      lddmm_integration_steps=lddmm_integration_steps,
-                     learning_rate_pose=1e-6,
-                     learning_rate_image=1e4,
+                     learning_rate_pose=1e-5,
+                     learning_rate_image=1e5,
                      fluid_params=fluid_params,
                      gpu=gpu,
                      world_size=args.world_size,
@@ -55,7 +56,7 @@ if not os.path.isfile(deeplddmmtestfile): # deep lddmm atlas
     # manually do testing, just compute the regularization and image MSE here
     _, _, deeplddmm_test_loss, _ = \
         deep_lddmm_atlas(oasis_ds_test_std,
-                     I0=I_deepaffine,
+                     I0=I_deeplddmm,
                      momentum_net = mom_net,
                      #I=I_deeplddmm_ft.clone(),
                      #num_epochs=500,
@@ -64,6 +65,7 @@ if not os.path.isfile(deeplddmmtestfile): # deep lddmm atlas
                      closed_form_image=False,
                      image_update_freq=100,
                      reg_weight=reg_weight,
+                     dropout=0,
                      #momentum_net=copy.deepcopy(mom_net_ft),
                      momentum_preconditioning=False,
                      lddmm_integration_steps=lddmm_integration_steps,

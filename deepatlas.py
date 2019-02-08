@@ -250,9 +250,9 @@ class MomentumPredictor(nn.Module):
                  img_size=(1,1,256,256,256),
                  conv_layers=[(5,4,2),
                               (5,4,2),
-                              (5,2,2),
-                              (3,1,1)],
-                 mlp_hidden=[256,128,64]):
+                              (5,4,2)],
+                 mlp_hidden=[2048,1024,2048],
+                 dropout=None):
         super(MomentumPredictor, self).__init__()
         self.img_size = img_size
         self.down_layers = conv_down_from_spec(conv_layers, img_size)
@@ -264,24 +264,24 @@ class MomentumPredictor(nn.Module):
         n_features = Itest.view(1,-1).shape[1]
         del Itest
         #print(f"n_features={n_features}")
-        self.mlp = MLP([n_features] + mlp_hidden)# + [n_features])
+        self.mlp = MLP([n_features] + mlp_hidden + [n_features], dropout=dropout)# + [n_features])
 
-        #self.up_layers = conv_up_from_spec(conv_layers, img_size, 3)
-        #self.up_layers_params = nn.ParameterList(chain(*[p.parameters() \
-                                             #for p in self.up_layers]))
+        self.up_layers = conv_up_from_spec(conv_layers, img_size, 3)
+        self.up_layers_params = nn.ParameterList(chain(*[p.parameters() \
+                                             for p in self.up_layers]))
         last_layer_scale=0e-5
-        self.dense_up = nn.Linear(mlp_hidden[-1], np.prod(img_size)*3)
+        #self.dense_up = nn.Linear(mlp_hidden[-1], np.prod(img_size)*3)
         with torch.no_grad():
-            self.dense_up.weight.mul_(last_layer_scale)
-            self.dense_up.bias.mul_(last_layer_scale)
-            #self.up_layers[-1].weight.mul_(last_layer_scale)
-            #self.up_layers[-1].bias.mul_(last_layer_scale)
+        #    self.dense_up.weight.mul_(last_layer_scale)
+        #    self.dense_up.bias.mul_(last_layer_scale)
+            self.up_layers[-1].weight.mul_(last_layer_scale)
+            self.up_layers[-1].bias.mul_(last_layer_scale)
     def down_net(self, x):
         d = x
         inds = []
         szs = []
         for l in self.down_layers:
-            szs.append(d.shape)
+            szs.append(d.size())
             ix = None
             if isinstance(l, nn.MaxPool3d):
                 d, ix = l(d)
@@ -294,16 +294,16 @@ class MomentumPredictor(nn.Module):
             if isinstance(l, nn.MaxUnpool3d):
                 d = l(d, ix, output_size=sz)
             elif isinstance(l, nn.ConvTranspose3d):
-                d = l(d, output_size=sz)
+                d = l(d)#, output_size=sz)
             else:
                 d = l(d)
         return d
     def forward(self, x):
         d, inds, szs = self.down_net(x)
         sh = d.shape
-        d = self.mlp(d.view(x.shape[0],-1))#.view(*sh)
-        d = self.dense_up(d).view(x.shape[0],3,*self.img_size[2:])
-        #d = self.up_net(d, inds, szs)
+        d = self.mlp(d.view(x.shape[0],-1)).view(*sh)
+        #d = self.dense_up(d).view(x.shape[0],3,*self.img_size[2:])
+        d = self.up_net(d, inds, szs)
         return d
 
     
@@ -313,6 +313,7 @@ def deep_lddmm_atlas(dataset,
         num_epochs=500,
         batch_size=2,
         reg_weight=.001,
+        dropout=None,
         closed_form_image=False,
         image_update_freq=10, # how many iters between image updates
         momentum_net=None,
@@ -326,6 +327,7 @@ def deep_lddmm_atlas(dataset,
         gpu=None,
         world_size=1,
         rank=0):
+    print(locals())
     from torch.utils.data import DataLoader, TensorDataset
     if gpu is None:
         device = 'cpu'
@@ -352,7 +354,7 @@ def deep_lddmm_atlas(dataset,
     epoch_losses = []
     iter_losses = []
     if momentum_net is None:
-        momentum_net = MomentumPredictor(img_size=I0.shape)
+        momentum_net = MomentumPredictor(img_size=I0.shape, dropout=dropout)
     momentum_net = momentum_net.to(device)
     print(f"Momentum network has {sum([p.numel() for p in momentum_net.parameters()])} parameters")
     if world_size > 1:
@@ -376,7 +378,7 @@ def deep_lddmm_atlas(dataset,
                 # the goal is to have learning rates that are independent of
                 # number and size of minibatches, but it's tricky to accomplish
                                       lr=learning_rate_pose*len(dataloader),
-                                      weight_decay=1e-2)
+                                      weight_decay=1e-4)
     image_optimizer = torch.optim.SGD([I],
                                       lr=learning_rate_image,
                                       weight_decay=0)
@@ -386,6 +388,7 @@ def deep_lddmm_atlas(dataset,
         epbar = tqdm(epbar, desc='epoch')
     for epoch in epbar:
         epoch_loss = 0.0
+        epoch_reg_term = 0.0
         itbar = dataloader
         if epoch > 1: # start using gradients for image after one epoch
             closed_form_image = False
@@ -408,20 +411,22 @@ def deep_lddmm_atlas(dataset,
             v = metric.sharp(m)
             reg_term = 0
             if reg_weight > 0:
-                reg_term = (v*m).sum()
+                reg_term = reg_weight*(v*m).sum()
             loss = (mse_loss(Idef, img, reduction='sum') + reg_term) \
                     / (img.numel())
             loss.backward()
             li = (loss*(img.shape[0]/len(dataloader.dataset))).detach()
             epoch_loss += li
+            ri = (reg_term*(img.shape[0]/(img.numel()*len(dataloader.dataset)))).detach()
+            epoch_reg_term += ri
             iter_losses.append(li.item())
-            iter_losses.append(loss.item())
             #itbar.set_postfix(minibatch_loss=loss.item())
             pose_optimizer.step()
             del loss, reg_term, v, m, h, Idef, img
         with torch.no_grad():
             if world_size > 1:
                 all_reduce(epoch_loss)
+                all_reduce(epoch_reg_term)
                 all_reduce(I.grad)
                 I.grad = I.grad/world_size
             # average over iterations
@@ -429,7 +434,7 @@ def deep_lddmm_atlas(dataset,
         image_optimizer.step()
         epoch_losses.append(epoch_loss.item())
         if rank == 0:
-            epbar.set_postfix(epoch_loss=epoch_loss)
+            epbar.set_postfix(epoch_loss=epoch_loss.item(), epoch_reg=epoch_reg_term.item())
     return I.detach(), momentum_net, epoch_losses, iter_losses
 
 
